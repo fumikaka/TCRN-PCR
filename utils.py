@@ -1,926 +1,741 @@
-import matplotlib
+# -*- coding: utf-8 -*-
+# @Author: Peng Xiang
+
+import types
 import torch
-
-matplotlib.use('Agg')
-
+import torch.nn.functional as F
 import numpy as np
-import os
-import matplotlib.pyplot as plt
-import torch.distributed as dist
+from torch import nn, einsum
+from pointnet2_ops.pointnet2_utils import furthest_point_sample, \
+    gather_operation, ball_query, three_nn, three_interpolate, grouping_operation
 
-from mpl_toolkits.mplot3d import Axes3D
-from torch.autograd import Variable
-from math import log, pi
-from metrics.ChamferDistancePytorch.chamfer3D import dist_chamfer_3D
-from visualize import visualize_pointcloud, visualize_pointcloud_batch
+class Conv1d(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size=1, stride=1, if_bn=True, activation_fn=torch.relu):
+        super(Conv1d, self).__init__()
+        self.conv = nn.Conv1d(in_channel, out_channel, kernel_size, stride=stride)
+        self.if_bn = if_bn
+        self.bn = nn.BatchNorm1d(out_channel)
+        self.activation_fn = activation_fn
 
+    def forward(self, input):
+        out = self.conv(input)
+        if self.if_bn:
+            out = self.bn(out)
 
-# Most code of this file is borrowed from: https://github.com/stevenygd/PointFlow/blob/master/utils.py
-def sphere_noise(batch, num_pts, device):
-    with torch.no_grad():
-        theta = 2 * np.pi * torch.rand(batch, num_pts, device=device)
-        phi = torch.acos(1 - 2 * torch.rand(batch, num_pts, device=device))
-        x = torch.sin(phi) * torch.cos(theta)
-        y = torch.sin(phi) * torch.sin(theta)
-        z = torch.cos(phi)
-    return torch.stack([x, y, z], dim=1)
+        if self.activation_fn is not None:
+            out = self.activation_fn(out)
 
+        return out
 
-def gaussian_noise(num, width, height):
-    return np.random.normal(0.0, 1.0, size=(num, 1, width, height))
+class Conv2d(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size=(1, 1), stride=(1, 1), if_bn=True, activation_fn=torch.relu):
+        super(Conv2d, self).__init__()
+        self.conv = nn.Conv2d(in_channel, out_channel, kernel_size, stride=stride)
+        self.if_bn = if_bn
+        self.bn = nn.BatchNorm2d(out_channel)
+        self.activation_fn = activation_fn
 
+    def forward(self, input):
+        out = self.conv(input)
+        if self.if_bn:
+            out = self.bn(out)
 
-# Visualization
-def visualize_point_clouds(pts, gtr, idx, pert_order=[0, 1, 2]):
-    pts = pts.cpu().detach().numpy()[:, pert_order]
-    gtr = gtr.cpu().detach().numpy()[:, pert_order]
+        if self.activation_fn is not None:
+            out = self.activation_fn(out)
 
-    fig = plt.figure(figsize=(6, 3))
-    ax1 = fig.add_subplot(121, projection='3d')
-    ax1.set_title("Sample:%s" % idx)
-    ax1.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=5)
+        return out
 
-    ax2 = fig.add_subplot(122, projection='3d')
-    ax2.set_title("Ground Truth:%s" % idx)
-    ax2.scatter(gtr[:, 0], gtr[:, 1], gtr[:, 2], s=5)
+class MLP(nn.Module):
+    def __init__(self, in_channel, layer_dims, bn=None):
+        super(MLP, self).__init__()
+        layers = []
+        last_channel = in_channel
+        for out_channel in layer_dims[:-1]:
+            layers.append(nn.Linear(last_channel, out_channel))
+            if bn:
+                layers.append(nn.BatchNorm1d(out_channel))
+            layers.append(nn.ReLU())
+            last_channel = out_channel
+        layers.append(nn.Linear(last_channel, layer_dims[-1]))
+        self.mlp = nn.Sequential(*layers)
 
-    fig.canvas.draw()
+    def forward(self, inputs):
+        return self.mlp(inputs)
 
-    # grab the pixel buffer and dump it into a numpy array
-    res = np.array(fig.canvas.renderer._renderer)
-    res = np.transpose(res, (2, 0, 1))
+class MLP_CONV(nn.Module):
+    def __init__(self, in_channel, layer_dims, bn=None):
+        super(MLP_CONV, self).__init__()
+        layers = []
+        last_channel = in_channel
+        for out_channel in layer_dims[:-1]:
+            layers.append(nn.Conv1d(last_channel, out_channel, 1))
+            if bn:
+                layers.append(nn.BatchNorm1d(out_channel))
+            layers.append(nn.ReLU())
+            last_channel = out_channel
+        layers.append(nn.Conv1d(last_channel, layer_dims[-1], 1))
+        self.mlp = nn.Sequential(*layers)
 
-    plt.close()
-    return res
+    def forward(self, inputs):
+        return self.mlp(inputs)
 
+class MLP_Res(nn.Module):
+    def __init__(self, in_dim=128, hidden_dim=None, out_dim=128):
+        super(MLP_Res, self).__init__()
+        if hidden_dim is None:
+            hidden_dim = in_dim
+        self.conv_1 = nn.Conv1d(in_dim, hidden_dim, 1)
+        self.conv_2 = nn.Conv1d(hidden_dim, out_dim, 1)
+        self.conv_shortcut = nn.Conv1d(in_dim, out_dim, 1)
 
-# Original validate function
-def validate(model, tloader, image_flag=False):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
-
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
-
-    all_sample = list()
-    all_ref = list()
-
-    for idx, (multi_view, pc, stat) in enumerate(tloader):
-        mv = np.stack(multi_view, axis=1).squeeze(1)
-        mv = torch.from_numpy(mv)
-
-        multi_view = mv.cuda()
-
-        tr_pc = pc.cuda()
-
-        out_pc = model.reconstruct(multi_view, 2048)
-
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-
-    result = compute_all_metrics(sample_pcs, ref_pcs, 64, accelerated_cd=True)
-    result = {k: (v.cpu().detach().item() if not isinstance(v, float) else v) for k, v in result.items()}
-
-    print("Chamfer Distance  :%s" % cd.item())
-    print("Earth Mover Distance :%s" % emd.item())
+    def forward(self, x):
+        """
+        Args:
+            x: (B, out_dim, n)
+        """
+        shortcut = self.conv_shortcut(x)
+        out = self.conv_2(torch.relu(self.conv_1(x))) + shortcut
+        return out
 
 
-def validate_shapenet(model, tloader, image_flag=False, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
+def sample_and_group(xyz, points, npoint, nsample, radius, use_xyz=True):
+    """
+    Args:
+        xyz: Tensor, (B, 3, N)
+        points: Tensor, (B, f, N)
+        npoint: int
+        nsample: int
+        radius: float
+        use_xyz: boolean
 
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
+    Returns:
+        new_xyz: Tensor, (B, 3, npoint)
+        new_points: Tensor, (B, 3 | f+3 | f, npoint, nsample)
+        idx_local: Tensor, (B, npoint, nsample)
+        grouped_xyz: Tensor, (B, 3, npoint, nsample)
 
-    all_sample = list()
-    all_ref = list()
+    """
+    xyz_flipped = xyz.permute(0, 2, 1).contiguous() # (B, N, 3)
+    new_xyz = gather_operation(xyz, furthest_point_sample(xyz_flipped, npoint)) # (B, 3, npoint)
 
-    for idx, (multi_view, pc, _) in enumerate(tloader):
-        mv = np.stack(multi_view, axis=1).squeeze(axis=1)
-        mv = torch.from_numpy(mv).float()
-        mv = mv.cuda()
+    idx = ball_query(radius, nsample, xyz_flipped, new_xyz.permute(0, 2, 1).contiguous()) # (B, npoint, nsample)
+    grouped_xyz = grouping_operation(xyz, idx) # (B, 3, npoint, nsample)
+    grouped_xyz -= new_xyz.unsqueeze(3).repeat(1, 1, 1, nsample)
 
-        tr_pc = pc.cuda()
-
-        if old_version:
-            out_pc = model(mv)
+    if points is not None:
+        grouped_points = grouping_operation(points, idx) # (B, f, npoint, nsample)
+        if use_xyz:
+            new_points = torch.cat([grouped_xyz, grouped_points], 1)
         else:
-            # out_pc = model(mv, label)       多类版本可能用到
-            out_pc = model(mv)
-
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-
-    print("Chamfer Distance  :%s" % cd.item())
-    print("Earth Mover Distance :%s" % emd.item())
-
-
-# Modified validate function for TDPNet
-def tdp_validate(model, tloader, image_flag=False, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
-
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
-
-    all_sample = list()
-    all_ref = list()
-
-    for idx, (multi_view, pc, stat, label) in enumerate(tloader):
-        mv = np.stack(multi_view, axis=1).squeeze(axis=1)
-        mv = torch.from_numpy(mv).float()
-        mv = mv.cuda()
-
-        tr_pc = pc.cuda()
-        bs = pc.shape[0]
-
-        if old_version:
-            # out_pc = model(mv)
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            syn_pc = model(mv)
-            out_pc = syn_pc[-1]
-            # out_pc = model(mv)
-        else:
-            out_pc = model(mv, label)
-
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
-
-
-def calc_cd(output, gt, calc_f1=False, return_raw=False, normalize=False, separate=False):
-    # cham_loss = dist_chamfer_3D.chamfer_3DDist()
-    cham_loss = dist_chamfer_3D.chamfer_3DDist()
-    dist1, dist2, idx1, idx2 = cham_loss(gt, output)
-    cd_p = (torch.sqrt(dist1).mean(1) + torch.sqrt(dist2).mean(1)) / 2
-    cd_t = (dist1.mean(1) + dist2.mean(1))
-
-    if separate:
-        res = [torch.cat([torch.sqrt(dist1).mean(1).unsqueeze(0), torch.sqrt(dist2).mean(1).unsqueeze(0)]),
-               torch.cat([dist1.mean(1).unsqueeze(0), dist2.mean(1).unsqueeze(0)])]
+            new_points = grouped_points
     else:
-        res = [cd_p, cd_t]
-    if calc_f1:
-        f1, _, _ = fscore(dist1, dist2, 0.0001)
-        res.append(f1)
-    if return_raw:
-        res.extend([dist1, dist2, idx1, idx2])
-    return res
+        new_points = grouped_xyz
+
+    return new_xyz, new_points, idx, grouped_xyz
 
 
-def calc_dcd(x, gt, alpha=100, n_lambda=0.1, return_raw=False, non_reg=False):
-    x = x.float()
-    gt = gt.float()
-    batch_size, n_x, _ = x.shape
-    batch_size, n_gt, _ = gt.shape
-    assert x.shape[0] == gt.shape[0]
+def sample_and_group_all(xyz, points, use_xyz=True):
+    """
+    Args:
+        xyz: Tensor, (B, 3, nsample)
+        points: Tensor, (B, f, nsample)
+        use_xyz: boolean
 
-    if non_reg:
-        frac_12 = max(1, n_x / n_gt)
-        frac_21 = max(1, n_gt / n_x)
+    Returns:
+        new_xyz: Tensor, (B, 3, 1)
+        new_points: Tensor, (B, f|f+3|3, 1, nsample)
+        idx: Tensor, (B, 1, nsample)
+        grouped_xyz: Tensor, (B, 3, 1, nsample)
+    """
+    b, _, nsample = xyz.shape
+    device = xyz.device
+    new_xyz = torch.zeros((1, 3, 1), dtype=torch.float, device=device).repeat(b, 1, 1)
+    grouped_xyz = xyz.reshape((b, 3, 1, nsample))
+    idx = torch.arange(nsample, device=device).reshape(1, 1, nsample).repeat(b, 1, 1)
+    if points is not None:
+        if use_xyz:
+            new_points = torch.cat([xyz, points], 1)
+        else:
+            new_points = points
+        new_points = new_points.unsqueeze(2)
     else:
-        frac_12 = n_x / n_gt
-        frac_21 = n_gt / n_x
+        new_points = grouped_xyz
 
-    cd_p, cd_t, dist1, dist2, idx1, idx2 = calc_cd(x, gt, return_raw=True)
-    # dist1 (batch_size, n_gt): a gt point finds its nearest neighbour x' in x;
-    # idx1  (batch_size, n_gt): the idx of x' \in [0, n_x-1]
-    # dist2 and idx2: vice versa
-    exp_dist1, exp_dist2 = torch.exp(-dist1 * alpha), torch.exp(-dist2 * alpha)
-
-    loss1 = []
-    loss2 = []
-    for b in range(batch_size):
-        count1 = torch.bincount(idx1[b])
-        weight1 = count1[idx1[b].long()].float().detach() ** n_lambda
-        weight1 = (weight1 + 1e-6) ** (-1) * frac_21
-        loss1.append((- exp_dist1[b] * weight1 + 1.).mean())
-
-        count2 = torch.bincount(idx2[b])
-        weight2 = count2[idx2[b].long()].float().detach() ** n_lambda
-        weight2 = (weight2 + 1e-6) ** (-1) * frac_12
-        loss2.append((- exp_dist2[b] * weight2 + 1.).mean())
-
-    loss1 = torch.stack(loss1)
-    loss2 = torch.stack(loss2)
-    loss = (loss1 + loss2) / 2
-
-    res = [loss, cd_p, cd_t]
-    if return_raw:
-        res.extend([dist1, dist2, idx1, idx2])
-
-    return res
+    return new_xyz, new_points, idx, grouped_xyz
 
 
-# Modified validate function for TDPNet
-def tdp_validate_dcd(model, tloader, image_flag=False, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
+class PointNet_SA_Module(nn.Module):
+    def __init__(self, npoint, nsample, radius, in_channel, mlp, if_bn=True, group_all=False, use_xyz=True):
+        """
+        Args:
+            npoint: int, number of points to sample
+            nsample: int, number of points in each local region
+            radius: float
+            in_channel: int, input channel of features(points)
+            mlp: list of int,
+        """
+        super(PointNet_SA_Module, self).__init__()
+        self.npoint = npoint
+        self.nsample = nsample
+        self.radius = radius
+        self.mlp = mlp
+        self.group_all = group_all
+        self.use_xyz = use_xyz
+        if use_xyz:
+            in_channel += 3
 
-    model.eval()
-    cd_list, emd_list, dcd_list = list(), list(), list()
-    ttl_samples = 0
+        last_channel = in_channel
+        self.mlp_conv = []
+        for out_channel in mlp:
+            self.mlp_conv.append(Conv2d(last_channel, out_channel, if_bn=if_bn))
+            last_channel = out_channel
 
-    all_sample = list()
-    all_ref = list()
+        self.mlp_conv = nn.Sequential(*self.mlp_conv)
 
-    for idx, (multi_view, pc, stat, label) in enumerate(tloader):
-        mv = np.stack(multi_view, axis=1).squeeze(axis=1)
-        mv = torch.from_numpy(mv).float()
-        mv = mv.cuda()
+    def forward(self, xyz, points):
+        """
+        Args:
+            xyz: Tensor, (B, 3, N)
+            points: Tensor, (B, f, N)
 
-        tr_pc = pc.cuda()
-        bs = pc.shape[0]
-
-        if old_version:
-            # out_pc = model(mv)
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(mv, noise)
-            # out_pc = model(mv)
+        Returns:
+            new_xyz: Tensor, (B, 3, npoint)
+            new_points: Tensor, (B, mlp[-1], npoint)
+        """
+        if self.group_all:
+            new_xyz, new_points, idx, grouped_xyz = sample_and_group_all(xyz, points, self.use_xyz)
         else:
-            out_pc = model(mv, label)
+            new_xyz, new_points, idx, grouped_xyz = sample_and_group(xyz, points, self.npoint, self.nsample, self.radius, self.use_xyz)
 
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
+        new_points = self.mlp_conv(new_points)
+        new_points = torch.max(new_points, 3)[0]
 
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        dcd_batch = calc_dcd(out_pc, tr_pc)
-        # dcd_loss = dcd[0]
-        dcd_list.append(dcd_batch[0])
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-    dcd = torch.cat(dcd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item(), dcd.item()
+        return new_xyz, new_points
 
 
-# Modified validate function for TDPNet
-def tdp_validate_npy(model, tloader, save_path, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
+class PointNet_FP_Module(nn.Module):
+    def __init__(self, in_channel, mlp, use_points1=False, in_channel_points1=None, if_bn=True):
+        """
+        Args:
+            in_channel: int, input channel of points2
+            mlp: list of int
+            use_points1: boolean, if use points
+            in_channel_points1: int, input channel of points1
+        """
+        super(PointNet_FP_Module, self).__init__()
+        self.use_points1 = use_points1
 
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
+        if use_points1:
+            in_channel += in_channel_points1
 
-    all_sample = list()
-    all_ref = list()
+        last_channel = in_channel
+        self.mlp_conv = []
+        for out_channel in mlp:
+            self.mlp_conv.append(Conv1d(last_channel, out_channel, if_bn=if_bn))
+            last_channel = out_channel
 
-    o = 0
-    for idx, (multi_view, pc, stat, label) in enumerate(tloader):
-        mv = np.stack(multi_view, axis=1).squeeze(axis=1)
-        mv = torch.from_numpy(mv).float()
-        mv = mv.cuda()
+        self.mlp_conv = nn.Sequential(*self.mlp_conv)
 
-        tr_pc = pc.cuda()
-        bs = pc.shape[0]
+    def forward(self, xyz1, xyz2, points1, points2):
+        """
+        Args:
+            xyz1: Tensor, (B, 3, N)
+            xyz2: Tensor, (B, 3, M)
+            points1: Tensor, (B, in_channel, N)
+            points2: Tensor, (B, in_channel, M)
 
-        if old_version:
-            # out_pc = model(mv)
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(mv, noise)
-            pc_cpu = out_pc.cpu()
-            visualize_pointcloud(pc[0], out_file=os.path.join(save_path, '{0}-{1}_true.jpg'.format(o,o+11)), elev=10,
-                                 azim=200)
-            for i, p in enumerate(pc_cpu):
-                visualize_pointcloud(p, out_file=os.path.join(save_path, '{0}_.jpg'.format( o)), elev=10,
-                                     azim=200)
+        Returns:MLP_CONV
+            new_points: Tensor, (B, mlp[-1], N)
+        """
+        dist, idx = three_nn(xyz1.permute(0, 2, 1).contiguous(), xyz2.permute(0, 2, 1).contiguous())
+        dist = torch.clamp_min(dist, 1e-10)  # (B, N, 3)
+        recip_dist = 1.0/dist
+        norm = torch.sum(recip_dist, 2, keepdim=True).repeat((1, 1, 3))
+        weight = recip_dist / norm
+        interpolated_points = three_interpolate(points2, idx, weight) # B, in_channel, N
 
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
-
-            # if idx<=5:
-            #     np.save("../pcs/test_{}.npy".format(idx),out_pc.cpu())
+        if self.use_points1:
+            new_points = torch.cat([interpolated_points, points1], 1)
         else:
-            out_pc = model(mv, label)
+            new_points = interpolated_points
 
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
+        new_points = self.mlp_conv(new_points)
+        return new_points
 
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
 
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
+def square_distance(src, dst):
+    """
+    Calculate Euclid distance between each two points.
 
-        ttl_samples += int(tr_pc.size(0))
+    src^T * dst = xn * xm + yn * ym + zn * zm；
+    sum(src^2, dim=-1) = xn*xn + yn*yn + zn*zn;
+    sum(dst^2, dim=-1) = xm*xm + ym*ym + zm*zm;
+    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
+         = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
 
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
+    Input:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Output:
+        dist: per-point square distance, [B, N, M]
+    """
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))  # B, N, M
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
+    return dist
 
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
 
-def shapenet_validate(model, tloader, image_flag=False, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
+def query_knn(nsample, xyz, new_xyz, include_self=True):
+    """Find k-NN of new_xyz in xyz"""
+    pad = 0 if include_self else 1
+    sqrdists = square_distance(new_xyz, xyz)  # B, S, N
+    idx = torch.argsort(sqrdists, dim=-1, descending=False)[:, :, pad: nsample+pad]
+    return idx.int()
 
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
 
-    all_sample = list()
-    all_ref = list()
+def sample_and_group_knn(xyz, points, npoint, k, use_xyz=True, idx=None):
+    """
+    Args:
+        xyz: Tensor, (B, 3, N)
+        points: Tensor, (B, f, N)
+        npoint: int
+        nsample: int
+        radius: float
+        use_xyz: boolean
 
-    for idx, data in enumerate(tloader):
-        image = data['image'].cuda()
-        tr_pc = data['points'].cuda()
-        # print(image[0][0].mean())
+    Returns:
+        new_xyz: Tensor, (B, 3, npoint)
+        new_points: Tensor, (B, 3 | f+3 | f, npoint, nsample)
+        idx_local: Tensor, (B, npoint, nsample)
+        grouped_xyz: Tensor, (B, 3, npoint, nsample)
 
-        # tr_pc = pc.cuda()
-        bs = tr_pc.shape[0]
+    """
+    xyz_flipped = xyz.permute(0, 2, 1).contiguous() # (B, N, 3)
+    new_xyz = gather_operation(xyz, furthest_point_sample(xyz_flipped, npoint)) # (B, 3, npoint)
+    if idx is None:
+        idx = query_knn(k, xyz_flipped, new_xyz.permute(0, 2, 1).contiguous())
+    grouped_xyz = grouping_operation(xyz, idx) # (B, 3, npoint, nsample)
+    grouped_xyz -= new_xyz.unsqueeze(3).repeat(1, 1, 1, k)
 
-        if old_version:
-            # out_pc = model(mv)
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image,noise)
+    if points is not None:
+        grouped_points = grouping_operation(points, idx) # (B, f, npoint, nsample)
+        if use_xyz:
+            new_points = torch.cat([grouped_xyz, grouped_points], 1)
         else:
-            # out_pc = model(mv, label)
-            # out_pc = model(mv)
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image)[-1]
+            new_points = grouped_points
+    else:
+        new_points = grouped_xyz
 
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-        # print(out_pc.size())
-        # print(tr_pc.size())
+    return new_xyz, new_points, idx, grouped_xyz
 
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
 
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
+class PointNet_SA_Module_KNN(nn.Module):
+    def __init__(self, npoint, nsample, in_channel, mlp, if_bn=True, group_all=False, use_xyz=True, if_idx=False):
+        """
+        Args:
+            npoint: int, number of points to sample
+            nsample: int, number of points in each local region
+            radius: float
+            in_channel: int, input channel of features(points)
+            mlp: list of int,
+        """
+        super(PointNet_SA_Module_KNN, self).__init__()
+        self.npoint = npoint
+        self.nsample = nsample
+        self.mlp = mlp
+        self.group_all = group_all
+        self.use_xyz = use_xyz
+        self.if_idx = if_idx
+        if use_xyz:
+            in_channel += 3
 
-        ttl_samples += int(tr_pc.size(0))
+        last_channel = in_channel
+        self.mlp_conv = []
+        for out_channel in mlp[:-1]:
+            self.mlp_conv.append(Conv2d(last_channel, out_channel, if_bn=if_bn))
+            last_channel = out_channel
+        self.mlp_conv.append(Conv2d(last_channel, mlp[-1], if_bn=False, activation_fn=None))
+        self.mlp_conv = nn.Sequential(*self.mlp_conv)
 
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
+    def forward(self, xyz, points, idx=None):
+        """
+        Args:
+            xyz: Tensor, (B, 3, N)
+            points: Tensor, (B, f, N)
 
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
-
-def shapenet_validate_dense(model, tloader,img_path,npy_path, overlap=1, image_flag=False, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
-
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
-
-    all_sample = list()
-    all_ref = list()
-    o=0
-
-    for idx, data in enumerate(tloader):
-        image = data['image'].cuda()
-        tr_pc = data['points'].cuda()
-        # print(image[0][0].mean())
-        pc=tr_pc.cpu()
-
-        # tr_pc = pc.cuda()
-        bs = tr_pc.shape[0]
-
-        if old_version:
-            # out_pc = model(mv)
-            out_pc=None
-            for count in range(overlap):
-                noise = sphere_noise(bs, num_pts=2048, device='cuda')
-                instance = model(image,noise)
-                if count==0:
-                    out_pc = instance
-                else:
-                    out_pc = torch.cat([out_pc, instance],dim=1)
-            pc_cpu = out_pc.cpu()
-            for i, p in enumerate(pc_cpu):
-                visualize_pointcloud(p, out_file=os.path.join(img_path, '{0}_.jpg'.format(o)), elev=10,
-                                     azim=200)
-                visualize_pointcloud(pc[i], out_file=os.path.join(img_path, '{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                np.save(os.path.join(npy_path, 'npy_file_{0}.npy'.format(o)), p)
-                np.save(os.path.join(npy_path, 'npy_true_{0}.npy'.format(o)), pc[i])
-                # print(p.size())
-                # print(pc[i].size())
-
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
-            # out_pc = model(image,noise)
+        Returns:
+            new_xyz: Tensor, (B, 3, npoint)
+            new_points: Tensor, (B, mlp[-1], npoint)
+        """
+        if self.group_all:
+            new_xyz, new_points, idx, grouped_xyz = sample_and_group_all(xyz, points, self.use_xyz)
         else:
-            # out_pc = model(mv, label)
-            # out_pc = model(mv)
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image)
+            new_xyz, new_points, idx, grouped_xyz = sample_and_group_knn(xyz, points, self.npoint, self.nsample, self.use_xyz, idx=idx)
 
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-        # print(out_pc.size())
-        # print(tr_pc.size())
+        new_points = self.mlp_conv(new_points)
+        new_points = torch.max(new_points, 3)[0]
 
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
-
-def pix3d_validate(model, tloader, image_flag=False, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
-
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
-
-    all_sample = list()
-    all_ref = list()
-
-    for idx, (img,pc) in enumerate(tloader):
-        image = img.float().cuda()
-        tr_pc = pc.float().cuda()
-        # print(type(image))
-        # print(type(tr_pc))
-
-        # tr_pc = pc.cuda()
-        bs = tr_pc.shape[0]
-
-        if old_version:
-            # out_pc = model(mv)
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image,noise)
+        if self.if_idx:
+            return new_xyz, new_points, idx
         else:
-            # out_pc = model(mv, label)
-            # out_pc = model(mv)
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image)[-1]
+            return new_xyz, new_points
 
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-        # print(out_pc.size())
-        # print(tr_pc.size())
 
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
+def fps_subsample(pcd, n_points=2048):
+    """
+    Args
+        pcd: (b, 16384, 3)
 
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
+    returns
+        new_pcd: (b, n_points, 3)
+    """
+    new_pcd = gather_operation(pcd.permute(0, 2, 1).contiguous(), furthest_point_sample(pcd, n_points))
+    new_pcd = new_pcd.permute(0, 2, 1).contiguous()
+    return new_pcd
 
-        ttl_samples += int(tr_pc.size(0))
 
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
+class Transformer(nn.Module):
+    def __init__(self, in_channel, dim=256, n_knn=16, pos_hidden_dim=64, attn_hidden_multiplier=4):
+        super(Transformer, self).__init__()
+        self.n_knn = n_knn
+        self.conv_key = nn.Conv1d(dim, dim, 1)
+        self.conv_query = nn.Conv1d(dim, dim, 1)
+        self.conv_value = nn.Conv1d(dim, dim, 1)
 
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
+        self.pos_mlp = nn.Sequential(
+            nn.Conv2d(3, pos_hidden_dim, 1),
+            nn.BatchNorm2d(pos_hidden_dim),
+            nn.ReLU(),
+            nn.Conv2d(pos_hidden_dim, dim, 1)
+        )
 
-def pix3d_validate_npy(model, tloader, img_path, npy_path, image_flag=False, old_version=True,category="no"):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
+        self.attn_mlp = nn.Sequential(
+            nn.Conv2d(dim, dim * attn_hidden_multiplier, 1),
+            nn.BatchNorm2d(dim * attn_hidden_multiplier),
+            nn.ReLU(),
+            nn.Conv2d(dim * attn_hidden_multiplier, dim, 1)
+        )
 
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
+        self.linear_start = nn.Conv1d(in_channel, dim, 1)
+        self.linear_end = nn.Conv1d(dim, in_channel, 1)
 
-    all_sample = list()
-    all_ref = list()
-    o=0
+    def forward(self, x, pos):
+        """feed forward of transformer
+        Args:
+            x: Tensor of features, (B, in_channel, n)
+            pos: Tensor of positions, (B, 3, n)
 
-    for idx, (img,pc) in enumerate(tloader):
-        image = img.float().cuda()
-        tr_pc = pc.float().cuda()
-        # print(type(image))
-        # print(type(tr_pc))
+        Returns:
+            y: Tensor of features with attention, (B, in_channel, n)
+        """
 
-        # tr_pc = pc.cuda()
-        bs = tr_pc.shape[0]
-        # o=0
+        identity = x
 
-        if old_version:
-            # out_pc = model(mv)
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image,noise)
-            pc_cpu = out_pc.cpu()
-            # visualize_pointcloud(pc[0], out_file=os.path.join(img_path, '{0}-{1}_true.jpg'.format(o, o + 11)), elev=10,
-            #                      azim=200)
-            # np.save(os.path.join(npy_path, 'npy_file_true_{0}-{1}.npy'.format(o, o + 11)), pc[0])
-            for i, p in enumerate(pc_cpu):
+        x = self.linear_start(x)
+        b, dim, n = x.shape
 
-                visualize_pointcloud(p, out_file=os.path.join(img_path, '{0}_{1}_.jpg'.format(category,o)), elev=10,
-                                azim=200)
-                visualize_pointcloud(pc[i], out_file=os.path.join(img_path, '{0}_{1}_true.jpg'.format(category,o)), elev=10,
-                                azim=200)
-                np.save(os.path.join(npy_path, 'npy_file_{0}_{1}.npy'.format(category,o)), p)
-                np.save(os.path.join(npy_path, 'npy_true_{0}_{1}.npy'.format(category, o)), pc[i])
+        pos_flipped = pos.permute(0, 2, 1).contiguous()
+        idx_knn = query_knn(self.n_knn, pos_flipped, pos_flipped)
+        key = self.conv_key(x)
+        value = self.conv_value(x)
+        query = self.conv_query(x)
 
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
+        key = grouping_operation(key, idx_knn)  # b, dim, n, n_knn
+        qk_rel = query.reshape((b, -1, n, 1)) - key
+
+        pos_rel = pos.reshape((b, -1, n, 1)) - grouping_operation(pos, idx_knn)  # b, 3, n, n_knn
+        pos_embedding = self.pos_mlp(pos_rel)  # b, dim, n, n_knn
+
+        attention = self.attn_mlp(qk_rel + pos_embedding)
+        attention = torch.softmax(attention, -1)
+
+        value = value.reshape((b, -1, n, 1)) + pos_embedding
+
+        agg = einsum('b c i j, b c i j -> b c i', attention, value)  # b, dim, n
+        y = self.linear_end(agg)
+
+        return y+identity
+
+
+class CouplingLayer(nn.Module):
+
+    def __init__(self, d, intermediate_dim, swap=False):
+        nn.Module.__init__(self)
+        self.d = d - (d // 2)
+        self.swap = swap
+        self.net_s_t = nn.Sequential(
+            nn.Linear(self.d, intermediate_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(intermediate_dim, intermediate_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(intermediate_dim, (d - self.d) * 2),
+        )
+
+    def forward(self, x, logpx=None, reverse=False):
+
+        if self.swap:
+            x = torch.cat([x[:, self.d:], x[:, :self.d]], 1)
+
+        in_dim = self.d
+        out_dim = x.shape[1] - self.d
+
+        s_t = self.net_s_t(x[:, :in_dim])
+        scale = torch.sigmoid(s_t[:, :out_dim] + 2.)
+        shift = s_t[:, out_dim:]
+
+        logdetjac = torch.sum(torch.log(scale).view(scale.shape[0], -1), 1, keepdim=True)
+
+        if not reverse:
+            y1 = x[:, self.d:] * scale + shift
+            delta_logp = -logdetjac
         else:
-            # out_pc = model(mv, label)
-            # out_pc = model(mv)
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image)[-1]
+            y1 = (x[:, self.d:] - shift) / scale
+            delta_logp = logdetjac
 
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            # out_pc = model(mv, noise)
-            pc_cpu = out_pc.cpu()
-            # visualize_pointcloud(pc[0], out_file=os.path.join(img_path, '{0}-{1}_true.jpg'.format(o, o + 11)), elev=10,
-            #                      azim=200)
-            # np.save(os.path.join(npy_path, 'npy_file_true_{0}-{1}.npy'.format(o, o + 11)), pc[0])
-            for i, p in enumerate(pc_cpu):
+        y = torch.cat([x[:, :self.d], y1], 1) if not self.swap else torch.cat([y1, x[:, :self.d]], 1)
 
-                visualize_pointcloud(p, out_file=os.path.join(img_path, '{0}_{1}_.jpg'.format(category, o)),
-                                    elev=10,
-                                    azim=200)
-                visualize_pointcloud(pc[i], out_file=os.path.join(img_path, '{0}_{1}_true.jpg'.format(category, o)),
-                                    elev=10,
-                                    azim=200)
-                # np.save(os.path.join(npy_path, 'npy_file_{}.npy'.format(o)), p)
-                np.save(os.path.join(npy_path, 'npy_file_{0}_{1}.npy'.format(category, o)), p)
-                np.save(os.path.join(npy_path, 'npy_true_{0}_{1}.npy'.format(category, o)), pc[i])
-
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
-
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-        # print(out_pc.size())
-        # print(tr_pc.size())
-
-        # loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        # cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-        dcd_batch = calc_dcd(out_pc, tr_pc)
-        cd_list.append(dcd_batch[2])
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
-
-
-def shapenet_validate_npy_newwork(model, tloader, img_path, npy_path, old_version=True,category=None):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
-
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
-
-    # all_sample = list()
-    # all_ref = list()
-    o = 0
-    final_img_path = os.path.join(img_path, 'final/{}'.format(category))
-    final_npy_path = os.path.join(npy_path, 'final/{}'.format(category))
-    if not os.path.exists(final_img_path):
-        os.mkdir(final_img_path)
-    if not os.path.exists(final_npy_path):
-        os.mkdir(final_npy_path)
-
-    corse_img_path = os.path.join(img_path, 'corse/{}'.format(category))
-    corse_npy_path = os.path.join(npy_path, 'corse/{}'.format(category))
-    if not os.path.exists(corse_img_path):
-        os.mkdir(corse_img_path)
-    if not os.path.exists(corse_npy_path):
-        os.mkdir(corse_npy_path)
-
-    faise1_img_path = os.path.join(img_path, 'faise1/{}'.format(category))
-    faise1_npy_path = os.path.join(npy_path, 'faise1/{}'.format(category))
-    if not os.path.exists(faise1_img_path):
-        os.mkdir(faise1_img_path)
-    if not os.path.exists(faise1_npy_path):
-        os.mkdir(faise1_npy_path)
-
-    faise2_img_path = os.path.join(img_path, 'faise2/{}'.format(category))
-    faise2_npy_path = os.path.join(npy_path, 'faise2/{}'.format(category))
-    if not os.path.exists(faise2_img_path):
-        os.mkdir(faise2_img_path)
-    if not os.path.exists(faise2_npy_path):
-        os.mkdir(faise2_npy_path)
-
-
-    for idx, data in enumerate(tloader):
-
-        image = data['image'].cuda()
-        tr_pc = data['points'].cuda()
-        # print(image[0][0].mean())
-
-        # tr_pc = pc.cuda()
-        bs = tr_pc.shape[0]
-
-        if old_version:
-            # out_pc = model(mv)
-
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image, noise)
-            pc_cpu = out_pc.cpu()
-            tp = tr_pc.cpu()
-            for i, p in enumerate(pc_cpu):
-                visualize_pointcloud(tp[i], out_file=os.path.join(img_path, '{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                np.save(os.path.join(npy_path, 'npy_file_true_{0}.npy'.format(o)), tp[i])
-                visualize_pointcloud(p, out_file=os.path.join(img_path, '{0}_.jpg'.format(o)), elev=10,
-                                     azim=200)
-                np.save(os.path.join(npy_path, 'npy_file_{}.npy'.format(o)), p)
-
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
+        if logpx is None:
+            return y
         else:
-            # out_pc = model(mv, label)
-            # out_pc = model(mv)
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image)
-            pc_cpu = out_pc[-1].cpu()
-            # print(pc_cpu.size())      #2048
-            pc_corse = out_pc[0].cpu()
-            # print(pc_corse.size())      #512
-            pc_faise1 = out_pc[1].cpu()
-            # print(pc_faise1.size())      #512
-            pc_faise2 = out_pc[2].cpu()
-            # print(pc_faise2.size())        #1024
-            tp = tr_pc.cpu()
-            # print(tp.size())             #2048
-            # visualize_pointcloud(tr_pc[0], out_file=os.path.join(img_path, '{0}-{1}_true.jpg'.format(o, o + 11)), elev=10,
-            #                      azim=200)
-            # np.save(os.path.join(npy_path, 'npy_file_true_{0}-{1}.npy'.format(o, o + 11)), tr_pc[0])
-            for i, p in enumerate(pc_cpu):
-                visualize_pointcloud(tp[i], out_file=os.path.join(final_img_path, '{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                np.save(os.path.join(final_npy_path, 'npy_file_true_{0}.npy'.format(o)), tp[i])
-                visualize_pointcloud(p, out_file=os.path.join(final_img_path, '{0}_.jpg'.format(o)), elev=10,
-                                     azim=200)
-                np.save(os.path.join(final_npy_path, 'npy_file_{}.npy'.format(o)), p)
-
-                visualize_pointcloud(tp[i], out_file=os.path.join(corse_img_path, '{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                visualize_pointcloud(pc_corse[i], out_file=os.path.join(corse_img_path, '{0}_.jpg'.format(o)), elev=10,
-                                     azim=200)
-                np.save(os.path.join(corse_npy_path, 'npy_file_{}.npy'.format(o)), pc_corse[i])
-                np.save(os.path.join(corse_npy_path, 'npy_file_true_{0}.npy'.format(o)), tp[i])
-
-                visualize_pointcloud(tp[i], out_file=os.path.join(faise1_img_path, '{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                visualize_pointcloud(pc_faise1[i], out_file=os.path.join(faise1_img_path, '{0}_.jpg'.format(o)), elev=10,
-                                     azim=200)
-                np.save(os.path.join(faise1_npy_path, 'npy_file_{}.npy'.format(o)), pc_faise1[i])
-                np.save(os.path.join(faise1_npy_path, 'npy_file_true_{0}.npy'.format(o)), tp[i])
-
-                visualize_pointcloud(tp[i], out_file=os.path.join(faise2_img_path, '{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                visualize_pointcloud(pc_faise2[i], out_file=os.path.join(faise2_img_path, '{0}_.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                np.save(os.path.join(faise2_npy_path, 'npy_file_{}.npy'.format(o)), pc_faise2[i])
-                np.save(os.path.join(faise2_npy_path, 'npy_file_true_{0}.npy'.format(o)), tp[i])
-
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
-
-        # all_sample.append(tr_pc)
-        # all_ref.append(out_pc)
-
-        loss_1, loss_2 = distChamferCUDA(out_pc[-1], tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        emd_batch = emd_approx(out_pc[-1], tr_pc)
-        emd_list.append(emd_batch)
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-
-    # sample_pcs = torch.cat(all_sample, dim=0)
-    # ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
-
-def shapenet_validate_npy(model, tloader, img_path, npy_path, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
-
-    model.eval()
-    cd_list, emd_list = list(), list()
-    ttl_samples = 0
-
-    all_sample = list()
-    all_ref = list()
-    o=0
-
-    for idx, data in enumerate(tloader):
-
-        image = data['image'].cuda()
-        tr_pc = data['points'].cuda()
-        # print(image[0][0].mean())
-
-        # tr_pc = pc.cuda()
-        bs = tr_pc.shape[0]
+            return y, logpx + delta_logp
 
 
+class SequentialFlow(nn.Module):
+    """A generalized nn.Sequential container for normalizing flows.
+    """
 
+    def __init__(self, layersList):
+        super(SequentialFlow, self).__init__()
+        self.chain = nn.ModuleList(layersList)
 
-        if old_version:
-            # out_pc = model(mv)
+    def forward(self, x, logpx=None, reverse=False, inds=None):
+        if inds is None:
+            if reverse:
+                inds = range(len(self.chain) - 1, -1, -1)
+            else:
+                inds = range(len(self.chain))
 
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image, noise)
-            pc_cpu = out_pc.cpu()
-            tp = tr_pc.cpu()
-            for i, p in enumerate(pc_cpu):
-                visualize_pointcloud(tp[i], out_file=os.path.join(img_path, '{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                np.save(os.path.join(npy_path, 'npy_file_true_{0}.npy'.format(o)), tp[i])
-                visualize_pointcloud(p, out_file=os.path.join(img_path, '{0}_.jpg'.format(o)), elev=10,
-                                     azim=200)
-                np.save(os.path.join(npy_path, 'npy_file_{}.npy'.format(o)), p)
-
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
+        if logpx is None:
+            for i in inds:
+                x = self.chain[i](x, reverse=reverse)
+            return x
         else:
-            # out_pc = model(mv, label)
-            # out_pc = model(mv)
-            # noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(image)
-            pc_cpu = out_pc[-1].cpu()
-            pc_corse = out_pc[0].cpu()
-            pc_faise1 = out_pc[1].cpu()
-            pc_faise2 = out_pc[2].cpu()
-            tp = tr_pc.cpu()
-            # visualize_pointcloud(tr_pc[0], out_file=os.path.join(img_path, '{0}-{1}_true.jpg'.format(o, o + 11)), elev=10,
-            #                      azim=200)
-            # np.save(os.path.join(npy_path, 'npy_file_true_{0}-{1}.npy'.format(o, o + 11)), tr_pc[0])
-            for i, p in enumerate(pc_cpu):
-                visualize_pointcloud(tp[i], out_file=os.path.join(img_path, '/final/{0}_true.jpg'.format(o)),
-                                     elev=10,
-                                     azim=200)
-                np.save(os.path.join(npy_path, '/final/npy_file_true_{0}.npy'.format(o)), tp[i])
-                visualize_pointcloud(p, out_file=os.path.join(img_path, '/final/{0}_.jpg'.format(o)), elev=10,
-                                     azim=200)
-                np.save(os.path.join(npy_path, '/final/npy_file_{}.npy'.format(o)), p)
+            for i in inds:
+                x, logpx = self.chain[i](x, logpx, reverse=reverse)
+            return x, logpx
 
 
-
-                # plt.savefig(multi_view[i::],os.path.join(save_path, '{0}_.jpg'.format( o))
-                o += 1
-
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item()
+def build_latent_flow(args):
+    chain = []
+    for i in range(args.latent_flow_depth):
+        chain.append(CouplingLayer(args.latent_dim, args.latent_flow_hidden_dim, swap=(i % 2 == 0)))
+    return SequentialFlow(chain)
 
 
-def shapenet_validate_dcd(model, tloader, image_flag=False, old_version=True):
-    from metrics.evaluation_metrics import emd_approx, distChamferCUDA, compute_all_metrics, \
-        jsd_between_point_cloud_sets
+##################
+## SpectralNorm ##
+##################
 
-    model.eval()
-    cd_list, emd_list, dcd_list = list(), list(), list()
-    ttl_samples = 0
+POWER_ITERATION_FN = "spectral_norm_power_iteration"
 
-    all_sample = list()
-    all_ref = list()
 
-    for idx, (multi_view, pc, _) in enumerate(tloader):
-        mv = np.stack(multi_view, axis=1).squeeze(axis=1)
-        mv = torch.from_numpy(mv).float()
-        mv = mv.cuda()
+class SpectralNorm(object):
+    def __init__(self, name='weight', dim=0, eps=1e-12):
+        self.name = name
+        self.dim = dim
+        self.eps = eps
 
-        tr_pc = pc.cuda()
-        bs = pc.shape[0]
+    def compute_weight(self, module, n_power_iterations):
+        if n_power_iterations < 0:
+            raise ValueError(
+                'Expected n_power_iterations to be non-negative, but '
+                'got n_power_iterations={}'.format(n_power_iterations)
+            )
 
-        if old_version:
-            # out_pc = model(mv)
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(mv, noise)
+        weight = getattr(module, self.name + '_orig')
+        u = getattr(module, self.name + '_u')
+        v = getattr(module, self.name + '_v')
+        weight_mat = weight
+        if self.dim != 0:
+            # permute dim to front
+            weight_mat = weight_mat.permute(self.dim, * [d for d in range(weight_mat.dim()) if d != self.dim])
+        height = weight_mat.size(0)
+        weight_mat = weight_mat.reshape(height, -1)
+        with torch.no_grad():
+            for _ in range(n_power_iterations):
+                # Spectral norm of weight equals to `u^T W v`, where `u` and `v`
+                # are the first left and right singular vectors.
+                # This power iteration produces approximations of `u` and `v`.
+                v = F.normalize(torch.matmul(weight_mat.t(), u), dim=0, eps=self.eps)
+                u = F.normalize(torch.matmul(weight_mat, v), dim=0, eps=self.eps)
+        setattr(module, self.name + '_u', u)
+        setattr(module, self.name + '_v', v)
+
+        sigma = torch.dot(u, torch.matmul(weight_mat, v))
+        weight = weight / sigma
+        setattr(module, self.name, weight)
+
+    def remove(self, module):
+        weight = getattr(module, self.name)
+        delattr(module, self.name)
+        delattr(module, self.name + '_u')
+        delattr(module, self.name + '_orig')
+        module.register_parameter(self.name, torch.nn.Parameter(weight))
+
+    def get_update_method(self, module):
+        def update_fn(module, n_power_iterations):
+            self.compute_weight(module, n_power_iterations)
+
+        return update_fn
+
+    def __call__(self, module, unused_inputs):
+        del unused_inputs
+        self.compute_weight(module, n_power_iterations=0)
+
+        # requires_grad might be either True or False during inference.
+        if not module.training:
+            r_g = getattr(module, self.name + '_orig').requires_grad
+            setattr(module, self.name, getattr(module, self.name).detach().requires_grad_(r_g))
+
+    @staticmethod
+    def apply(module, name, dim, eps):
+        fn = SpectralNorm(name, dim, eps)
+        weight = module._parameters[name]
+        height = weight.size(dim)
+
+        u = F.normalize(weight.new_empty(height).normal_(0, 1), dim=0, eps=fn.eps)
+        v = F.normalize(weight.new_empty(int(weight.numel() / height)).normal_(0, 1), dim=0, eps=fn.eps)
+        delattr(module, fn.name)
+        module.register_parameter(fn.name + "_orig", weight)
+        # We still need to assign weight back as fn.name because all sorts of
+        # things may assume that it exists, e.g., when initializing weights.
+        # However, we can't directly assign as it could be an nn.Parameter and
+        # gets added as a parameter. Instead, we register weight.data as a
+        # buffer, which will cause weight to be included in the state dict
+        # and also supports nn.init due to shared storage.
+        module.register_buffer(fn.name, weight.data)
+        module.register_buffer(fn.name + "_u", u)
+        module.register_buffer(fn.name + "_v", v)
+
+        setattr(module, POWER_ITERATION_FN, types.MethodType(fn.get_update_method(module), module))
+
+        module.register_forward_pre_hook(fn)
+        return fn
+
+
+def inplace_spectral_norm(module, name='weight', dim=None, eps=1e-12):
+    r"""Applies spectral normalization to a parameter in the given module.
+    .. math::
+         \mathbf{W} = \dfrac{\mathbf{W}}{\sigma(\mathbf{W})} \\
+         \sigma(\mathbf{W}) = \max_{\mathbf{h}: \mathbf{h} \ne 0} \dfrac{\|\mathbf{W} \mathbf{h}\|_2}{\|\mathbf{h}\|_2}
+    Spectral normalization stabilizes the training of discriminators (critics)
+    in Generaive Adversarial Networks (GANs) by rescaling the weight tensor
+    with spectral norm :math:`\sigma` of the weight matrix calculated using
+    power iteration method. If the dimension of the weight tensor is greater
+    than 2, it is reshaped to 2D in power iteration method to get spectral
+    norm. This is implemented via a hook that calculates spectral norm and
+    rescales weight before every :meth:`~Module.forward` call.
+    See `Spectral Normalization for Generative Adversarial Networks`_ .
+    .. _`Spectral Normalization for Generative Adversarial Networks`: https://arxiv.org/abs/1802.05957
+    Args:
+        module (nn.Module): containing module
+        name (str, optional): name of weight parameter
+        n_power_iterations (int, optional): number of power iterations to
+            calculate spectal norm
+        dim (int, optional): dimension corresponding to number of outputs,
+            the default is 0, except for modules that are instances of
+            ConvTranspose1/2/3d, when it is 1
+        eps (float, optional): epsilon for numerical stability in
+            calculating norms
+    Returns:
+        The original module with the spectal norm hook
+    Example::
+        >>> m = spectral_norm(nn.Linear(20, 40))
+        Linear (20 -> 40)
+        >>> m.weight_u.size()
+        torch.Size([20])
+    """
+    if dim is None:
+        if isinstance(module, (torch.nn.ConvTranspose1d, torch.nn.ConvTranspose2d, torch.nn.ConvTranspose3d)):
+            dim = 1
         else:
-            # out_pc = model(mv, label)
-            # out_pc = model(mv)
-            noise = sphere_noise(bs, num_pts=2048, device='cuda')
-            out_pc = model(mv, noise)
-
-        all_sample.append(tr_pc)
-        all_ref.append(out_pc)
-
-        loss_1, loss_2 = distChamferCUDA(out_pc, tr_pc)
-        cd_list.append(loss_1.mean(dim=1) + loss_2.mean(dim=1))
-
-        emd_batch = emd_approx(out_pc, tr_pc)
-        emd_list.append(emd_batch)
-
-        dcd_batch = calc_dcd(out_pc, tr_pc)
-        # dcd_loss = dcd[0]
-        dcd_list.append(dcd_batch[0])
-
-        ttl_samples += int(tr_pc.size(0))
-
-    cd = torch.cat(cd_list).mean()
-    emd = torch.cat(emd_list).mean()
-    dcd = torch.cat(dcd_list).mean()
-
-    sample_pcs = torch.cat(all_sample, dim=0)
-    ref_pcs = torch.cat(all_ref, dim=0)
-    return cd.item(), emd.item(), dcd.item()
+            dim = 0
+    SpectralNorm.apply(module, name, dim=dim, eps=eps)
+    return module
 
 
-def reduce_tensor(tensor, world_size=None):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    if world_size is None:
-        world_size = dist.get_world_size()
+def remove_spectral_norm(module, name='weight'):
+    r"""Removes the spectral normalization reparameterization from a module.
+    Args:
+        module (nn.Module): containing module
+        name (str, optional): name of weight parameter
+    Example:
+        >>> m = spectral_norm(nn.Linear(40, 10))
+        >>> remove_spectral_norm(m)
+    """
+    for k, hook in module._forward_pre_hooks.items():
+        if isinstance(hook, SpectralNorm) and hook.name == name:
+            hook.remove(module)
+            del module._forward_pre_hooks[k]
+            return module
 
-    rt /= world_size
-    return rt
+    raise ValueError("spectral_norm of '{}' not found in {}".format(name, module))
+
+
+def add_spectral_norm(model, logger=None):
+    """Applies spectral norm to all modules within the scope of a CNF."""
+
+    def apply_spectral_norm(module):
+        if 'weight' in module._parameters:
+            if logger: logger.info("Adding spectral norm to {}".format(module))
+            inplace_spectral_norm(module, 'weight')
+
+    def find_coupling_layer(module):
+        if isinstance(module, CouplingLayer):
+            module.apply(apply_spectral_norm)
+        else:
+            for child in module.children():
+                find_coupling_layer(child)
+
+    find_coupling_layer(model)
+
+
+def spectral_norm_power_iteration(model, n_power_iterations=1):
+
+    def recursive_power_iteration(module):
+        if hasattr(module, POWER_ITERATION_FN):
+            getattr(module, POWER_ITERATION_FN)(n_power_iterations)
+
+    model.apply(recursive_power_iteration)
+
+def reparameterize_gaussian(mean, logvar):
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn(std.size()).to(mean)
+    return mean + std * eps
+
+
+
+def gaussian_entropy(logvar):
+    const = 0.5 * float(logvar.size(1)) * (1. + np.log(np.pi * 2))
+    ent = 0.5 * logvar.sum(dim=1, keepdim=False) + const
+    return ent
 
 
 def standard_normal_logprob(z):
     dim = z.size(-1)
-    log_z = -0.5 * dim * log(2 * pi)
+    log_z = -0.5 * dim * np.log(2 * np.pi)
     return log_z - z.pow(2) / 2
+
+def truncated_normal_(tensor, mean=0, std=1, trunc_std=2):
+    """
+    Taken from https://discuss.pytorch.org/t/implementing-truncated-normal-initializer/4778/15
+    """
+    size = tensor.shape
+    tmp = tensor.new_empty(size + (4,)).normal_()
+    valid = (tmp < trunc_std) & (tmp > -trunc_std)
+    ind = valid.max(-1, keepdim=True)[1]
+    tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
+    tensor.data.mul_(std).add_(mean)
+    return tensor
